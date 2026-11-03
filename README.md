@@ -176,6 +176,10 @@ openssl pkey -in tellyscope-primary.pem -pubout -outform DER | openssl base64 -A
 
 The two `.pub` lines are also what the app builds in. Changing them needs an app release.
 
+**Sign last, after review, and only a branch you'll merge.** Once a signed `index.json` is on GitHub
+it stays fetchable by its commit forever, and anyone serving it from their own address gets it shown
+as "Signed by Tellyscope", even if the pull request was rejected.
+
 Every update to the lists (a monthly editors' pick, a contributor's pull request, the daily sync):
 
 1. On the pull request's branch, run `python3 tools/build.py index`.
