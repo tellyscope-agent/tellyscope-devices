@@ -216,3 +216,60 @@ class Lists(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Signing(unittest.TestCase):
+    """index.json.sig: what an app trusts, so check must fail whenever it doesn't cover index.json."""
+
+    def setUp(self):
+        import shutil
+        import subprocess
+        import tempfile
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        (self.root / "keys").mkdir()
+        self.real, build.ROOT = build.ROOT, self.root
+        self.addCleanup(setattr, build, "ROOT", self.real)
+        for name in ("primary", "other"):
+            subprocess.run(["openssl", "genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256",
+                            "-out", str(self.root / f"{name}.pem")], check=True, capture_output=True)
+        (self.root / "keys" / "primary.pub").write_text("# test\n" + self.public("primary") + "\n")
+        (self.root / "keys" / "backup.pub").write_text("# placeholder\n")
+        (self.root / "index.json").write_text('{"schema": 1, "version": 2026110301}\n')
+
+    def public(self, name):
+        import base64
+        import subprocess
+        der = subprocess.run(["openssl", "pkey", "-in", str(self.root / f"{name}.pem"), "-pubout", "-outform", "DER"],
+                             check=True, capture_output=True).stdout
+        return base64.b64encode(der).decode()
+
+    def test_a_signed_index_passes(self):
+        self.assertEqual(build.sign(self.root / "primary.pem"), 0)
+        self.assertEqual(build.check_signature(), [])
+
+    def test_an_edit_after_signing_fails(self):
+        build.sign(self.root / "primary.pem")
+        (self.root / "index.json").write_text('{"schema": 1, "version": 2026110302}\n')
+        self.assertIn("doesn't verify", "\n".join(build.check_signature()))
+
+    def test_a_missing_signature_fails(self):
+        self.assertIn("index.json.sig is missing", "\n".join(build.check_signature()))
+
+    def test_sign_refuses_a_key_not_in_keys(self):
+        self.assertEqual(build.sign(self.root / "other.pem"), 1)
+        self.assertFalse((self.root / "index.json.sig").exists())
+
+    def test_the_backup_key_verifies_too(self):
+        (self.root / "keys" / "backup.pub").write_text(self.public("other") + "\n")
+        build.sign(self.root / "other.pem")
+        self.assertEqual(build.check_signature(), [])
+
+    def test_a_key_that_is_not_p256_is_caught(self):
+        (self.root / "keys" / "backup.pub").write_text("bm90IGEga2V5\n")
+        self.assertIn("not a base64 P-256 public key", "\n".join(build.public_keys()[1]))
+
+    def test_version_stays_while_nothing_changes_and_only_goes_up(self):
+        (self.root / "index.json").write_text('{"schema": 1, "version": 2099010105, "devices": []}\n')
+        self.assertEqual(build.version({"schema": 1, "devices": []}), 2099010105)
+        self.assertEqual(build.version({"schema": 1, "devices": [1]}), 2099010106)

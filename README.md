@@ -18,6 +18,8 @@ here. Nothing reaches apps until a maintainer merges it.
 | `devices/<id>.json` | the sync | One TV model's list. `<id>` is the cleanyourtv folder name. |
 | `match/<id>.json` | people | How to recognise that TV. The sync never writes here. |
 | `index.json` | `tools/build.py index` | Every device, with its match rule or `null`: what an app downloads first. |
+| `index.json.sig` | `tools/build.py sign` | The maintainer's signature over `index.json`. |
+| `keys/*.pub` | the maintainer | The public keys Tellyscope builds in, for `check` to verify the signature against. |
 | `upstream.txt` | the sync | The cleanyourtv commit `devices/` was built from. |
 | `lists/launchers.json` | people | Home screens Tellyscope can install, and the line it shows for each. |
 | `lists/labels.json` | people | App names to show when the TV doesn't give one. |
@@ -43,16 +45,22 @@ An app that sees a `schema` it doesn't know shows no suggestions.
 The files under `lists/` and `logos/` work the same way: the index gives each one's `file` and
 `sha256`, so an app downloads one again only when its `sha256` changes.
 
-`sha256` only catches a truncated or corrupt download. It comes from the same place as the file, so it
-proves nothing about who wrote it. The protection is the review before merge, plus the app's own rules:
-`keep` can only add to the packages an app refuses to touch, never remove from them, and an app acts
-only on packages the TV itself lists.
+`sha256` only catches a truncated or corrupt download. It comes from the same place as the file, so on
+its own it proves nothing about who wrote it. That's what `index.json.sig` is for: an ECDSA P-256
+signature over the exact bytes of `index.json`, made with a key only the maintainer holds. Because the
+index carries every file's `sha256`, one signature covers every list and logo. Tellyscope has the
+public keys built in; it trusts a source's lists only when the signature verifies, whatever its address,
+and it refuses an index whose `version` is older than the one it already has. Anything else is
+treated as not signed by Tellyscope. On top of that come the app's own rules: `keep` can only add to the
+packages an app refuses to touch, never remove from them, and an app acts only on packages the TV
+itself lists.
 
 ## Use your own lists
 
 1. Fork this repo and edit the lists.
-2. Run `python3 tools/build.py index`, then `python3 tools/build.py check`, so `index.json` stays on
-   schema 1 with fresh `sha256` values.
+2. Run `python3 tools/build.py index`, then `python3 tools/build.py check --unsigned`, so `index.json`
+   stays on schema 1 with fresh `sha256` values. You can't sign it with Tellyscope's key, so leave
+   `index.json.sig` alone (or delete it); the app will say your lists aren't signed by Tellyscope.
 3. In Tellyscope 0.2.0 or later, open Settings → Debloat lists → Change and paste the address of the
    folder that holds `index.json`, like `https://raw.githubusercontent.com/<you>/tellyscope-devices/main/`.
    Reset to default switches back.
@@ -144,6 +152,40 @@ colours. Every logo is used by a service and has a row in `logos/SOURCES.md`.
 `{"schema", "source": {"repo", "commit"}, "devices": [{"id", "name", "match", "sdk", "file", "sha256"}], "lists": {"<name>": {"file", "sha256"}}, "logos": {"<logo>": {"file", "sha256"}}}`,
 one `devices` entry per device file, with `match` copied from `match/<id>.json` (`null` when there is
 none) and `sdk` from `tested.sdk`; `lists` has `launchers`, `labels`, `streaming` and `protected`.
+`version` is `YYYYMMDDNN` (UTC date, then a counter): `index` keeps it while nothing else changes and
+raises it otherwise, so it only goes up.
+
+### `index.json.sig` and `keys/*.pub`
+
+`index.json.sig` is one line: base64 of the DER-encoded ECDSA P-256 signature, SHA-256, over the exact
+bytes of `index.json` (an app trims the trailing newline before decoding). Each `keys/*.pub` holds one
+base64 SubjectPublicKeyInfo (DER) for a P-256 key; lines starting with `#` are comments, and a file
+with only comments is a placeholder. `check` passes when any key verifies the signature.
+
+## Signing (maintainer)
+
+There are two keypairs: the primary, used for every update, and a backup kept offline, so losing the
+primary doesn't lock apps out. Both private keys stay on the maintainer's machine, never in this repo
+or in CI. Make each one once:
+
+```sh
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out tellyscope-primary.pem
+openssl pkey -in tellyscope-primary.pem -pubout -outform DER | openssl base64 -A > keys/primary.pub
+# the same with tellyscope-backup.pem > keys/backup.pub, then store tellyscope-backup.pem offline
+```
+
+The two `.pub` lines are also what the app builds in. Changing them needs an app release.
+
+Every update to the lists (a monthly editors' pick, a contributor's pull request, the daily sync):
+
+1. On the pull request's branch, run `python3 tools/build.py index`.
+2. `python3 tools/build.py sign --key ~/path/to/tellyscope-primary.pem`. It refuses a key that
+   `keys/` doesn't verify.
+3. Commit `index.json` and `index.json.sig` to the branch. `Check` fails until the signature matches,
+   so nothing unsigned reaches `main`.
+4. Merge.
+
+The sync force-pushes `sync/cleanyourtv`, so sign and merge its pull request on the same day.
 
 ## Contributing
 
@@ -156,7 +198,8 @@ none) and `sdk` from `tested.sdk`; `lists` has `launchers`, `labels`, `streaming
 - **A new logo** needs a source that is CC0 (like [Simple Icons](https://simpleicons.org)) or tagged
   PD-textlogo on Wikimedia Commons, and a row in `logos/SOURCES.md` with its URL and licence. With
   neither, set the service's name in plain type instead. `check` fails on a logo without a row.
-- Before a pull request: `python3 -m unittest discover -s tests` and `python3 tools/build.py check`.
+- Before a pull request: `python3 -m unittest discover -s tests` and `python3 tools/build.py check --unsigned`.
+  The maintainer signs before merging, so `Check` on your pull request fails on the signature until then.
 
 The sync runs daily (and on demand from the Actions tab). It rebuilds `devices/` and opens or refreshes
 one pull request from `sync/cleanyourtv`; it force-pushes that branch, so don't commit to it. A pull

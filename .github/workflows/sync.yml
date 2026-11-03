@@ -30,7 +30,7 @@ jobs:
           old=$(cut -d' ' -f2 upstream.txt)
           echo "OLD=$old" >> "$GITHUB_ENV"
           python3 tools/build.py sync upstream
-          python3 tools/build.py check
+          python3 tools/build.py check --unsigned
 
       - name: Open or refresh the sync pull request
         env:

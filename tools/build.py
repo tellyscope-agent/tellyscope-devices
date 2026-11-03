@@ -3,15 +3,20 @@
 
   tools/build.py sync <cleanyourtv checkout>   rewrite devices/ from its examples/, then index
   tools/build.py index                         rebuild index.json from devices/, match/, lists/ and logos/
-  tools/build.py check                         fail if anything is invalid or index.json is stale
+  tools/build.py sign --key <private key.pem>  write index.json.sig, signed with that key
+  tools/build.py check [--unsigned]            fail if anything is invalid, index.json is stale or
+                                               index.json.sig doesn't verify against keys/ (--unsigned skips that)
 
-The file format is in README.md.
+The file format is in README.md. Signing and checking signatures need the openssl command.
 """
+import base64
+import datetime
 import hashlib
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 SCHEMA = 1
@@ -38,6 +43,8 @@ PNG = b"\x89PNG\r\n\x1a\n"
 # Logos are drawn at four times their size in dp and have to fit the smallest pill, 72 x 30 dp.
 LOGO_MAX = (72 * 4, 30 * 4)
 LOGO_BYTES = 64 * 1024
+# Every P-256 public key in SubjectPublicKeyInfo DER starts with these bytes, then 64 bytes of point.
+P256_SPKI = bytes.fromhex("3059301306072a8648ce3d020106082a8648ce3d030107034200" "04")
 
 
 def dump(obj):
@@ -174,10 +181,93 @@ def build_index():
     def file(path):
         return {"file": path, "sha256": hashlib.sha256((ROOT / path).read_bytes()).hexdigest()}
 
-    return {"schema": SCHEMA, "source": {"repo": upstream[0], "commit": upstream[1]},
-            "devices": devices,
-            "lists": {name: file(f"lists/{name}.json") for name in LISTS},
-            "logos": {f.stem: file(f"logos/{f.name}") for f in sorted((ROOT / "logos").glob("*.png"))}}
+    index = {"schema": SCHEMA, "source": {"repo": upstream[0], "commit": upstream[1]},
+             "devices": devices,
+             "lists": {name: file(f"lists/{name}.json") for name in LISTS},
+             "logos": {f.stem: file(f"logos/{f.name}") for f in sorted((ROOT / "logos").glob("*.png"))}}
+    return {"schema": SCHEMA, "version": version(index), **index}
+
+
+def version(index):
+    """index.json's version: the old one when nothing else changed, else YYYYMMDDNN for today (UTC),
+    always above the old one. An app refuses an index older than the one it has."""
+    path = ROOT / "index.json"
+    old = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    previous = old.pop("version", 0)
+    if old == index and previous:
+        return previous
+    return max(previous + 1, int(datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")) * 100 + 1)
+
+
+def public_keys():
+    """keys/*.pub: one base64 SubjectPublicKeyInfo per file, '#' lines are comments. Returns (keys, errors)."""
+    keys, errors = [], []
+    for f in sorted((ROOT / "keys").glob("*.pub")):
+        lines = [l.strip() for l in f.read_text(encoding="utf-8").splitlines()]
+        lines = [l for l in lines if l and not l.startswith("#")]
+        if not lines:
+            continue  # a placeholder
+        try:
+            der = base64.b64decode("".join(lines), validate=True)
+        except ValueError:
+            der = b""
+        if len(der) != len(P256_SPKI) + 64 or not der.startswith(P256_SPKI):
+            errors.append(f"keys/{f.name}: not a base64 P-256 public key")
+        else:
+            keys.append(der)
+    if not keys and not errors:
+        errors.append("keys/: no public key to check index.json.sig against")
+    return keys, errors
+
+
+def openssl(*args):
+    return subprocess.run(["openssl", *args], capture_output=True)
+
+
+def verifies(data, signature, key):
+    """True if signature (DER ECDSA) is over data with key (SPKI DER), SHA-256."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "data").write_bytes(data)
+        (tmp / "sig").write_bytes(signature)
+        (tmp / "key.der").write_bytes(key)
+        return openssl("dgst", "-sha256", "-keyform", "DER", "-verify", str(tmp / "key.der"),
+                       "-signature", str(tmp / "sig"), str(tmp / "data")).returncode == 0
+
+
+def check_signature():
+    keys, errors = public_keys()
+    sig = ROOT / "index.json.sig"
+    if errors:
+        return errors
+    if not sig.is_file():
+        return ["index.json.sig is missing: run tools/build.py sign --key <private key>"]
+    try:
+        signature = base64.b64decode(sig.read_text(encoding="utf-8").strip(), validate=True)
+    except ValueError:
+        return ["index.json.sig: not base64"]
+    data = (ROOT / "index.json").read_bytes()
+    if not any(verifies(data, signature, k) for k in keys):
+        return ["index.json.sig doesn't verify against keys/: index.json changed since it was signed, "
+                "run tools/build.py sign --key <private key>"]
+    return []
+
+
+def sign(key):
+    """Sign index.json's exact bytes with key and write index.json.sig, if a key in keys/ verifies it."""
+    data = (ROOT / "index.json").read_bytes()
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "data").write_bytes(data)
+        run = openssl("dgst", "-sha256", "-sign", str(key), str(Path(tmp) / "data"))
+    if run.returncode != 0:
+        print(run.stderr.decode(errors="replace"), file=sys.stderr)
+        return 1
+    keys, errors = public_keys()
+    if errors or not any(verifies(data, run.stdout, k) for k in keys):
+        print(*errors, "the signature doesn't verify against any key in keys/: wrong key?", sep="\n", file=sys.stderr)
+        return 1
+    (ROOT / "index.json.sig").write_text(base64.b64encode(run.stdout).decode() + "\n", encoding="utf-8")
+    return 0
 
 
 def png_size(data):
@@ -320,7 +410,7 @@ def check_lists():
     return errors
 
 
-def check():
+def check(signed=True):
     errors = []
     for mf in sorted((ROOT / "match").glob("*.json")):
         try:
@@ -347,14 +437,18 @@ def check():
     index = ROOT / "index.json"
     if not index.is_file() or index.read_text(encoding="utf-8") != dump(build_index()):
         errors.append("index.json is stale: run tools/build.py index")
+    elif signed:
+        errors += check_signature()
     for e in errors:
         print(e, file=sys.stderr)
     return 1 if errors else 0
 
 
 def main(argv):
-    if argv == ["check"]:
-        return check()
+    if argv[:1] == ["check"] and argv[1:] in ([], ["--unsigned"]):
+        return check(signed=not argv[1:])
+    if argv[:2] == ["sign", "--key"] and len(argv) == 3:
+        return sign(argv[2])
     if argv[:1] == ["sync"] and len(argv) == 2:
         sync(argv[1])
     elif argv != ["index"]:
